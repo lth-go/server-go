@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +27,24 @@ func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
 	return tc, nil
 }
 
+type contextKey struct {
+	name string
+}
+
+var (
+	// ServerContextKey is a context key. It can be used in HTTP
+	// handlers with context.WithValue to access the server that
+	// started the handler. The associated value will be of
+	// type *Server.
+	ServerContextKey = &contextKey{"http-server"}
+
+	// LocalAddrContextKey is a context key. It can be used in
+	// HTTP handlers with context.WithValue to access the address
+	// the local address the connection arrived on.
+	// The associated value will be of type net.Addr.
+	LocalAddrContextKey = &contextKey{"local-addr"}
+)
+
 // Server 服务器
 type Server struct {
 	Addr    string  // TCP address to listen on, ":http" if empty
@@ -47,9 +66,18 @@ type Server struct {
 	disableKeepAlives int32 // accessed atomically.
 }
 
-func (s *Server) logf(format string, args ...interface{}) {
-	if s.ErrorLog != nil {
-		s.ErrorLog.Printf(format, args...)
+// Create new connection from rwc.
+func (srv *Server) newConn(rwc net.Conn) *conn {
+	return &conn{
+		server: srv,
+		rwc:    rwc,
+	}
+
+}
+
+func (srv *Server) logf(format string, args ...interface{}) {
+	if srv.ErrorLog != nil {
+		srv.ErrorLog.Printf(format, args...)
 	} else {
 		log.Printf(format, args...)
 	}
@@ -69,29 +97,9 @@ func (srv *Server) ListenAndServe() error {
 	return srv.Serve(tcpKeepAliveListener{ln.(*net.TCPListener)})
 }
 
-type contextKey struct {
-	name string
-}
-
-var (
-	// ServerContextKey is a context key. It can be used in HTTP
-	// handlers with context.WithValue to access the server that
-	// started the handler. The associated value will be of
-	// type *Server.
-	ServerContextKey = &contextKey{"http-server"}
-
-	// LocalAddrContextKey is a context key. It can be used in
-	// HTTP handlers with context.WithValue to access the address
-	// the local address the connection arrived on.
-	// The associated value will be of type net.Addr.
-	LocalAddrContextKey = &contextKey{"local-addr"}
-)
-
 // Serve 运行服务
 func (srv *Server) Serve(l net.Listener) error {
 	defer l.Close()
-
-	var tempDelay time.Duration // how long to sleep on accept failure
 
 	// TODO 上下文
 	baseCtx := context.Background()
@@ -99,37 +107,16 @@ func (srv *Server) Serve(l net.Listener) error {
 	ctx = context.WithValue(ctx, LocalAddrContextKey, l.Addr())
 	for {
 		rw, e := l.Accept()
-		// 连接出错, 自动重连
 		if e != nil {
-			if ne, ok := e.(net.Error); ok && ne.Temporary() {
-				if tempDelay == 0 {
-					tempDelay = 5 * time.Millisecond
-				} else {
-					tempDelay *= 2
-				}
-				if max := 1 * time.Second; tempDelay > max {
-					tempDelay = max
-				}
-				srv.logf("http: Accept error: %v; retrying in %v", e, tempDelay)
-				time.Sleep(tempDelay)
-				continue
-			}
 			return e
 		}
-		tempDelay = 0
 		c := srv.newConn(rw)
 		// 连接
 		go c.serve(ctx)
 	}
 }
-
-// Create new connection from rwc.
-func (srv *Server) newConn(rwc net.Conn) *conn {
-	c := &conn{
-		server: srv,
-		rwc:    rwc,
-	}
-	return c
+func (srv *Server) doKeepAlives() bool {
+	return atomic.LoadInt32(&srv.disableKeepAlives) == 0
 }
 
 // DefaultMaxHeaderBytes is the maximum permitted size of the headers

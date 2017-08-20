@@ -15,6 +15,9 @@ import (
 	"time"
 )
 
+// For parsing this time format, see ParseTime.
+const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
+
 // chunkWriter writes to a response's conn buffer, and is the writer
 // wrapped by the response.bufw buffered writer.
 //
@@ -42,73 +45,7 @@ type chunkWriter struct {
 	// set by the writeHeader method:
 	chunking bool // using chunked transfer encoding for reply body
 }
-func (cw *chunkWriter) close() {
-	if !cw.wroteHeader {
-		cw.writeHeader(nil)
-	}
-	if cw.chunking {
-		bw := cw.res.conn.bufw // conn's bufio writer
-		// zero chunk to mark EOF
-		bw.WriteString("0\r\n")
-		if len(cw.res.trailers) > 0 {
-			trailers := make(Header)
-			for _, h := range cw.res.trailers {
-				if vv := cw.res.handlerHeader[h]; len(vv) > 0 {
-					trailers[h] = vv
-				}
-			}
-			trailers.Write(bw) // the writer handles noting errors
-		}
-		// final blank line after the trailers (whether
-		// present or not)
-		bw.WriteString("\r\n")
-	}
-}
 
-// maxPostHandlerReadBytes is the max number of Request.Body bytes not
-// consumed by a handler that the server will read from the client
-// in order to keep a connection alive. If there are more bytes than
-// this then the server to be paranoid instead sends a "Connection:
-// close" response.
-//
-// This number is approximately what a typical machine's TCP buffer
-// size is anyway.  (if we have the bytes on the machine, we might as
-// well read them)
-const maxPostHandlerReadBytes = 256 << 10
-
-// wrapper around io.ReaderCloser which on first read, sends an
-// HTTP/1.1 100 Continue header
-type expectContinueReader struct {
-	resp       *response
-	readCloser io.ReadCloser
-	closed     bool
-	sawEOF     bool
-}
-
-func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
-	if ecr.closed {
-		return 0, ErrBodyReadAfterClose
-	}
-	if !ecr.resp.wroteContinue {
-		ecr.resp.wroteContinue = true
-		ecr.resp.conn.bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
-		ecr.resp.conn.bufw.Flush()
-	}
-	n, err = ecr.readCloser.Read(p)
-	if err == io.EOF {
-		ecr.sawEOF = true
-	}
-	return
-}
-
-func (ecr *expectContinueReader) Close() error {
-	ecr.closed = true
-	return ecr.readCloser.Close()
-}
-
-// writeHeader finalizes the header sent to the client and writes it
-// to cw.res.conn.bufw.
-//
 // p is not written by writeHeader, but is the first chunk of the body
 // that will be written. It is sniffed for a Content-Type if none is
 // set explicitly. It's also used to set the Content-Length, if the
@@ -384,6 +321,73 @@ func (cw *chunkWriter) Write(p []byte) (n int, err error) {
 	}
 	return
 }
+func (cw *chunkWriter) close() {
+	if !cw.wroteHeader {
+		cw.writeHeader(nil)
+	}
+	if cw.chunking {
+		bw := cw.res.conn.bufw // conn's bufio writer
+		// zero chunk to mark EOF
+		bw.WriteString("0\r\n")
+		if len(cw.res.trailers) > 0 {
+			trailers := make(Header)
+			for _, h := range cw.res.trailers {
+				if vv := cw.res.handlerHeader[h]; len(vv) > 0 {
+					trailers[h] = vv
+				}
+			}
+			trailers.Write(bw) // the writer handles noting errors
+		}
+		// final blank line after the trailers (whether
+		// present or not)
+		bw.WriteString("\r\n")
+	}
+}
+
+// maxPostHandlerReadBytes is the max number of Request.Body bytes not
+// consumed by a handler that the server will read from the client
+// in order to keep a connection alive. If there are more bytes than
+// this then the server to be paranoid instead sends a "Connection:
+// close" response.
+//
+// This number is approximately what a typical machine's TCP buffer
+// size is anyway.  (if we have the bytes on the machine, we might as
+// well read them)
+const maxPostHandlerReadBytes = 256 << 10
+
+// wrapper around io.ReaderCloser which on first read, sends an
+// HTTP/1.1 100 Continue header
+type expectContinueReader struct {
+	resp       *response
+	readCloser io.ReadCloser
+	closed     bool
+	sawEOF     bool
+}
+
+func (ecr *expectContinueReader) Read(p []byte) (n int, err error) {
+	if ecr.closed {
+		return 0, ErrBodyReadAfterClose
+	}
+	if !ecr.resp.wroteContinue {
+		ecr.resp.wroteContinue = true
+		ecr.resp.conn.bufw.WriteString("HTTP/1.1 100 Continue\r\n\r\n")
+		ecr.resp.conn.bufw.Flush()
+	}
+	n, err = ecr.readCloser.Read(p)
+	if err == io.EOF {
+		ecr.sawEOF = true
+	}
+	return
+}
+
+func (ecr *expectContinueReader) Close() error {
+	ecr.closed = true
+	return ecr.readCloser.Close()
+}
+
+// writeHeader finalizes the header sent to the client and writes it
+// to cw.res.conn.bufw.
+//
 
 type response struct {
 	conn             *conn
@@ -445,28 +449,6 @@ func (w *response) Write(data []byte) (n int, err error) {
 	return w.write(len(data), data, "")
 }
 
-// Errors used by the HTTP server.
-var (
-	// ErrBodyNotAllowed is returned by ResponseWriter.Write calls
-	// when the HTTP method or response code does not permit a
-	// body.
-	ErrBodyNotAllowed = errors.New("http: request method or response status code does not allow body")
-
-	// ErrHijacked is returned by ResponseWriter.Write calls when
-	// the underlying connection has been hijacked using the
-	// Hijacker interfaced.
-	ErrHijacked = errors.New("http: connection has been hijacked")
-
-	// ErrContentLength is returned by ResponseWriter.Write calls
-	// when a Handler set a Content-Length response header with a
-	// declared size and then attempted to write more bytes than
-	// declared.
-	ErrContentLength = errors.New("http: wrote more than the declared Content-Length")
-
-	// Deprecated: ErrWriteAfterFlush is no longer used.
-	ErrWriteAfterFlush = errors.New("unused")
-)
-
 // either dataB or dataS is non-zero.
 func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err error) {
 	if !w.wroteHeader {
@@ -476,12 +458,12 @@ func (w *response) write(lenData int, dataB []byte, dataS string) (n int, err er
 		return 0, nil
 	}
 	if !w.bodyAllowed() {
-		return 0, ErrBodyNotAllowed
+		return 0, errors.New("http: request method or response status code does not allow body")
 	}
 
 	w.written += int64(lenData) // ignoring errors, for errorKludge
 	if w.contentLength != -1 && w.written > w.contentLength {
-		return 0, ErrContentLength
+		return 0, errors.New("http: wrote more than the declared Content-Length")
 	}
 	if dataB != nil {
 		return w.w.Write(dataB)
@@ -581,6 +563,29 @@ func (w *response) Header() Header {
 	return w.handlerHeader
 }
 
+// requestTooLarge is called by maxBytesReader when too much input has
+// been read from the client.
+func (w *response) requestTooLarge() {
+	w.closeAfterReply = true
+	w.requestBodyLimitHit = true
+	if !w.wroteHeader {
+		w.Header().Set("Connection", "close")
+	}
+}
+
+// declareTrailer is called for each Trailer header when the
+// response header is written. It notes that a header will need to be
+// written in the trailers at the end of the response.
+func (w *response) declareTrailer(k string) {
+	k = CanonicalHeaderKey(k)
+	switch k {
+	case "Transfer-Encoding", "Content-Length", "Trailer":
+		// Forbidden by RFC 2616 14.40.
+		return
+	}
+	w.trailers = append(w.trailers, k)
+}
+
 type atomicBool int32
 
 func (b *atomicBool) isSet() bool { return atomic.LoadInt32((*int32)(b)) != 0 }
@@ -591,8 +596,6 @@ func (b *atomicBool) setTrue()    { atomic.StoreInt32((*int32)(b), 1) }
 // zone. The time being formatted must be in UTC for Format to
 // generate the correct format.
 //
-// For parsing this time format, see ParseTime.
-const TimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
 
 // appendTime is a non-allocating version of []byte(t.UTC().Format(TimeFormat))
 func appendTime(b []byte, t time.Time) []byte {
@@ -666,19 +669,6 @@ var (
 	colonSpace = []byte(": ")
 )
 
-// requestTooLarge is called by maxBytesReader when too much input has
-// been read from the client.
-func (w *response) requestTooLarge() {
-	w.closeAfterReply = true
-	w.requestBodyLimitHit = true
-	if !w.wroteHeader {
-		w.Header().Set("Connection", "close")
-	}
-}
-func (s *Server) doKeepAlives() bool {
-	return atomic.LoadInt32(&s.disableKeepAlives) == 0
-}
-
 // extraHeader is the set of headers sometimes added by chunkWriter.writeHeader.
 // This type is used to avoid extra allocations from cloning and/or populating
 // the response Header map and all its 1-element slices.
@@ -690,17 +680,17 @@ type extraHeader struct {
 	contentLength    []byte // written if not nil
 }
 
+var (
+	headerContentLength = []byte("Content-Length: ")
+	headerDate          = []byte("Date: ")
+)
+
 // Sorted the same as extraHeader.Write's loop.
 var extraHeaderKeys = [][]byte{
 	[]byte("Content-Type"),
 	[]byte("Connection"),
 	[]byte("Transfer-Encoding"),
 }
-
-var (
-	headerContentLength = []byte("Content-Length: ")
-	headerDate          = []byte("Date: ")
-)
 
 // Write writes the headers described in h to w.
 //
@@ -744,27 +734,4 @@ func foreachHeaderElement(v string, fn func(string)) {
 			fn(f)
 		}
 	}
-}
-
-// declareTrailer is called for each Trailer header when the
-// response header is written. It notes that a header will need to be
-// written in the trailers at the end of the response.
-func (w *response) declareTrailer(k string) {
-	k = CanonicalHeaderKey(k)
-	switch k {
-	case "Transfer-Encoding", "Content-Length", "Trailer":
-		// Forbidden by RFC 2616 14.40.
-		return
-	}
-	w.trailers = append(w.trailers, k)
-}
-
-// unreadDataSizeLocked returns the number of bytes of unread input.
-// It returns -1 if unknown.
-// b.mu must be held.
-func (b *body) unreadDataSizeLocked() int64 {
-	if lr, ok := b.src.(*io.LimitedReader); ok {
-		return lr.N
-	}
-	return -1
 }

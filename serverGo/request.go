@@ -14,22 +14,6 @@ import (
 	"sync"
 )
 
-// HTTP request parsing errors.
-type ProtocolError struct {
-	ErrorString string
-}
-
-func (err *ProtocolError) Error() string { return err.ErrorString }
-
-var (
-	ErrHeaderTooLong        = &ProtocolError{"header too long"}
-	ErrShortBody            = &ProtocolError{"entity body too short"}
-	ErrNotSupported         = &ProtocolError{"feature not supported"}
-	ErrUnexpectedTrailer    = &ProtocolError{"trailer header without chunked transfer encoding"}
-	ErrMissingContentLength = &ProtocolError{"missing ContentLength in HEAD response"}
-	ErrNotMultipart         = &ProtocolError{"request Content-Type isn't multipart/form-data"}
-	ErrMissingBoundary      = &ProtocolError{"no multipart boundary param in Content-Type"}
-)
 
 type badStringError struct {
 	what string
@@ -206,17 +190,6 @@ type Request struct {
 	// It is an error to set this field in an HTTP client request.
 	RequestURI string
 
-	// Cancel is an optional channel whose closure indicates that the client
-	// request should be regarded as canceled. Not all implementations of
-	// RoundTripper may support Cancel.
-	//
-	// For server requests, this field is not applicable.
-	//
-	// Deprecated: Use the Context and WithContext methods
-	// instead. If a Request's Cancel field and context are both
-	// set, it is undefined whether Cancel is respected.
-	Cancel <-chan struct{}
-
 	// ctx is either the client or server context. It should only
 	// be modified via copying the whole Request using WithContext.
 	// It is unexported to prevent people from using Context wrong
@@ -232,136 +205,6 @@ func (r *Request) ProtoAtLeast(major, minor int) bool {
 }
 func (r *Request) wantsClose() bool {
 	return hasToken(r.Header.get("Connection"), "close")
-}
-
-var textprotoReaderPool sync.Pool
-
-func newTextprotoReader(br *bufio.Reader) *textproto.Reader {
-	if v := textprotoReaderPool.Get(); v != nil {
-		tr := v.(*textproto.Reader)
-		tr.R = br
-		return tr
-	}
-	return textproto.NewReader(br)
-}
-func putTextprotoReader(r *textproto.Reader) {
-	r.R = nil
-	textprotoReaderPool.Put(r)
-}
-
-func readRequest(b *bufio.Reader, deleteHostHeader bool) (req *Request, err error) {
-	tp := newTextprotoReader(b)
-	req = new(Request)
-
-	// First line: GET /index.html HTTP/1.0
-	// 读取第一行内容
-	var s string
-	if s, err = tp.ReadLine(); err != nil {
-		return nil, err
-	}
-	defer func() {
-		putTextprotoReader(tp)
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-	}()
-
-	// 解析请求
-	var ok bool
-	req.Method, req.RequestURI, req.Proto, ok = parseRequestLine(s)
-	if !ok {
-		return nil, &badStringError{"malformed HTTP request", s}
-	}
-	rawurl := req.RequestURI
-	if req.ProtoMajor, req.ProtoMinor, ok = ParseHTTPVersion(req.Proto); !ok {
-		return nil, &badStringError{"malformed HTTP version", req.Proto}
-	}
-
-	// 解析地址
-	if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
-		return nil, err
-	}
-
-	// Subsequent lines: Key: value.
-	// 读取请求头
-	mimeHeader, err := tp.ReadMIMEHeader()
-	if err != nil {
-		return nil, err
-	}
-	req.Header = Header(mimeHeader)
-
-	// RFC 2616: Must treat
-	//	GET /index.html HTTP/1.1
-	//	Host: www.google.com
-	// and
-	//	GET http://www.google.com/index.html HTTP/1.1
-	//	Host: doesntmatter
-	// the same. In the second case, any Host line is ignored.
-	req.Host = req.URL.Host
-	if req.Host == "" {
-		req.Host = req.Header.get("Host")
-	}
-	if deleteHostHeader {
-		delete(req.Header, "Host")
-	}
-
-	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
-
-	err = readTransfer(req, b)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
-}
-
-// parseRequestLine parses "GET /foo HTTP/1.1" into its three parts.
-func parseRequestLine(line string) (method, requestURI, proto string, ok bool) {
-	s1 := strings.Index(line, " ")
-	s2 := strings.Index(line[s1+1:], " ")
-	if s1 < 0 || s2 < 0 {
-		return
-	}
-	s2 += s1 + 1
-	return line[:s1], line[s1+1 : s2], line[s2+1:], true
-}
-
-// ParseHTTPVersion ...
-func ParseHTTPVersion(vers string) (major, minor int, ok bool) {
-	const Big = 1000000 // arbitrary upper bound
-	switch vers {
-	case "HTTP/1.1":
-		return 1, 1, true
-	case "HTTP/1.0":
-		return 1, 0, true
-	}
-	if !strings.HasPrefix(vers, "HTTP/") {
-		return 0, 0, false
-	}
-	dot := strings.Index(vers, ".")
-	if dot < 0 {
-		return 0, 0, false
-	}
-	major, err := strconv.Atoi(vers[5:dot])
-	if err != nil || major < 0 || major > Big {
-		return 0, 0, false
-	}
-	minor, err = strconv.Atoi(vers[dot+1:])
-	if err != nil || minor < 0 || minor > Big {
-		return 0, 0, false
-	}
-	return major, minor, true
-}
-
-// http1ServerSupportsRequest reports whether Go's HTTP/1.x server
-// supports the given request.
-func http1ServerSupportsRequest(req *Request) bool {
-	if req.ProtoMajor == 1 {
-		return true
-	}
-	// Reject HTTP/0.x, and all other HTTP/2+ requests (which
-	// aren't encoded in ASCII anyway).
-	return false
 }
 
 type maxBytesReader struct {
@@ -420,6 +263,122 @@ func (l *maxBytesReader) Read(p []byte) (n int, err error) {
 func (l *maxBytesReader) Close() error {
 	return l.r.Close()
 }
-func MaxBytesReader(w ResponseWriter, r io.ReadCloser, n int64) io.ReadCloser {
-	return &maxBytesReader{w: w, r: r, n: n}
+
+// ParseHTTPVersion ...
+func ParseHTTPVersion(vers string) (major, minor int, ok bool) {
+	const Big = 1000000 // arbitrary upper bound
+	switch vers {
+	case "HTTP/1.1":
+		return 1, 1, true
+	case "HTTP/1.0":
+		return 1, 0, true
+	}
+	if !strings.HasPrefix(vers, "HTTP/") {
+		return 0, 0, false
+	}
+	dot := strings.Index(vers, ".")
+	if dot < 0 {
+		return 0, 0, false
+	}
+	major, err := strconv.Atoi(vers[5:dot])
+	if err != nil || major < 0 || major > Big {
+		return 0, 0, false
+	}
+	minor, err = strconv.Atoi(vers[dot+1:])
+	if err != nil || minor < 0 || minor > Big {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
+// parseRequestLine parses "GET /foo HTTP/1.1" into its three parts.
+func parseRequestLine(line string) (method, requestURI, proto string, ok bool) {
+	s1 := strings.Index(line, " ")
+	s2 := strings.Index(line[s1+1:], " ")
+	if s1 < 0 || s2 < 0 {
+		return
+	}
+	s2 += s1 + 1
+	return line[:s1], line[s1+1 : s2], line[s2+1:], true
+}
+func readRequest(b *bufio.Reader) (req *Request, err error) {
+	tp := newTextprotoReader(b)
+
+	req = new(Request)
+
+	// First line: GET /index.html HTTP/1.0
+	// 读取第一行内容
+	var s string
+	if s, err = tp.ReadLine(); err != nil {
+		return nil, err
+	}
+	// 缓存
+	defer func() {
+		putTextprotoReader(tp)
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+
+	// 解析请求
+	var ok bool
+	req.Method, req.RequestURI, req.Proto, ok = parseRequestLine(s)
+	print(req.Method, req.RequestURI, req.Proto)
+	if !ok {
+		return nil, &badStringError{"malformed HTTP request", s}
+	}
+	rawurl := req.RequestURI
+	if req.ProtoMajor, req.ProtoMinor, ok = ParseHTTPVersion(req.Proto); !ok {
+		return nil, &badStringError{"malformed HTTP version", req.Proto}
+	}
+
+	// 解析地址
+	if req.URL, err = url.ParseRequestURI(rawurl); err != nil {
+		return nil, err
+	}
+
+	// Subsequent lines: Key: value.
+	// 读取请求头
+	mimeHeader, err := tp.ReadMIMEHeader()
+	if err != nil {
+		return nil, err
+	}
+	req.Header = Header(mimeHeader)
+
+	// RFC 2616: Must treat
+	//	GET /index.html HTTP/1.1
+	//	Host: www.google.com
+	// and
+	//	GET http://www.google.com/index.html HTTP/1.1
+	//	Host: doesntmatter
+	// the same. In the second case, any Host line is ignored.
+	req.Host = req.URL.Host
+	if req.Host == "" {
+		req.Host = req.Header.get("Host")
+	}
+
+	// 在transfer中用到
+	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
+
+	err = readTransfer(req, b)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+var textprotoReaderPool sync.Pool
+
+func newTextprotoReader(br *bufio.Reader) *textproto.Reader {
+	if v := textprotoReaderPool.Get(); v != nil {
+		tr := v.(*textproto.Reader)
+		tr.R = br
+		return tr
+	}
+	return textproto.NewReader(br)
+}
+func putTextprotoReader(r *textproto.Reader) {
+	r.R = nil
+	textprotoReaderPool.Put(r)
 }

@@ -7,10 +7,6 @@ import (
 	"io"
 )
 
-const maxLineLength = 4096 // assumed <= bufio.defaultBufSize
-
-var ErrLineTooLong = errors.New("header line too long")
-
 // NewChunkedReader returns a new chunkedReader that translates the data read from r
 // out of HTTP "chunked" format before returning it.
 // The chunkedReader returns io.EOF when the final 0-length chunk is read.
@@ -18,10 +14,7 @@ var ErrLineTooLong = errors.New("header line too long")
 // NewChunkedReader is not needed by normal applications. The http package
 // automatically decodes chunking when reading response bodies.
 func NewChunkedReader(r io.Reader) io.Reader {
-	br, ok := r.(*bufio.Reader)
-	if !ok {
-		br = bufio.NewReader(r)
-	}
+	br := r.(*bufio.Reader)
 	return &chunkedReader{r: br}
 }
 
@@ -39,6 +32,7 @@ func (cr *chunkedReader) beginChunk() {
 	if cr.err != nil {
 		return
 	}
+	// 处理16进制数据
 	cr.n, cr.err = parseHexUint(line)
 	if cr.err != nil {
 		return
@@ -65,6 +59,7 @@ func (cr *chunkedReader) Read(b []uint8) (n int, err error) {
 				// reading a new chunk header.
 				break
 			}
+			// 从远端读取数据
 			cr.beginChunk()
 			continue
 		}
@@ -92,6 +87,9 @@ func (cr *chunkedReader) Read(b []uint8) (n int, err error) {
 	}
 	return n, cr.err
 }
+
+const maxLineLength = 4096 // assumed <= bufio.defaultBufSize
+var ErrLineTooLong = errors.New("header line too long")
 
 // Read a line of bytes (up to \n) from b.
 // Give up if the line exceeds maxLineLength.

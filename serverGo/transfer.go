@@ -13,6 +13,15 @@ import (
 	"sync"
 )
 
+// HTTP request parsing errors.
+type ProtocolError struct {
+	ErrorString string
+}
+
+func (err *ProtocolError) Error() string { return err.ErrorString }
+
+var ErrUnexpectedTrailer = &ProtocolError{"trailer header without chunked transfer encoding"}
+
 var (
 	singleCRLF = []byte("\r\n")
 	doubleCRLF = []byte("\r\n\r\n")
@@ -112,24 +121,6 @@ func (t *transferReader) fixTransferEncoding() error {
 	return nil
 }
 
-func shouldClose(major, minor int, header Header, removeCloseHeader bool) bool {
-	if major < 1 {
-		return true
-	}
-
-	conv := header["Connection"]
-	hasClose := HeaderValuesContainsToken(conv, "close")
-	if major == 1 && minor == 0 {
-		return hasClose || !HeaderValuesContainsToken(conv, "keep-alive")
-	}
-
-	if hasClose && removeCloseHeader {
-		header.Del("Connection")
-	}
-
-	return hasClose
-}
-
 type eofReaderWithWriteTo struct{}
 
 func (eofReaderWithWriteTo) WriteTo(io.Writer) (int64, error) { return 0, nil }
@@ -143,24 +134,17 @@ var eofReader = &struct {
 	ioutil.NopCloser(nil),
 }
 
-func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
+func readTransfer(req *Request, r *bufio.Reader) (err error) {
 	t := &transferReader{RequestMethod: "GET"}
 
-	// Unify input
-	isResponse := false
-	switch rr := msg.(type) {
-	case *Request:
-		t.Header = rr.Header
-		t.RequestMethod = rr.Method
-		t.ProtoMajor = rr.ProtoMajor
-		t.ProtoMinor = rr.ProtoMinor
-		// Transfer semantics for Requests are exactly like those for
-		// Responses with status code 200, responding to a GET method
-		t.StatusCode = 200
-		t.Close = rr.Close
-	default:
-		panic("unexpected type")
-	}
+	t.Header = req.Header
+	t.RequestMethod = req.Method
+	t.ProtoMajor = req.ProtoMajor
+	t.ProtoMinor = req.ProtoMinor
+	// Transfer semantics for Requests are exactly like those for
+	// Responses with status code 200, responding to a GET method
+	t.StatusCode = 200
+	t.Close = req.Close
 
 	// Default to HTTP/1.1
 	if t.ProtoMajor == 0 && t.ProtoMinor == 0 {
@@ -175,22 +159,14 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 	}
 
 	// 修正content-length的值, 判断值是否合法
-	realLength, err := fixLength(isResponse, t.StatusCode, t.RequestMethod, t.Header, t.TransferEncoding)
+	realLength, err := fixLength(t.StatusCode, t.RequestMethod, t.Header, t.TransferEncoding)
 	if err != nil {
 		return err
 	}
-	if isResponse && t.RequestMethod == "HEAD" {
-		if n, err := parseContentLength(t.Header.get("Content-Length")); err != nil {
-			return err
-		} else {
-			t.ContentLength = n
-		}
-	} else {
-		t.ContentLength = realLength
-	}
+
+	t.ContentLength = realLength
 
 	// Trailer
-	// TODO 不知道什么用
 	t.Trailer, err = fixTrailer(t.Header, t.TransferEncoding)
 	if err != nil {
 		return err
@@ -203,7 +179,7 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 		if noBodyExpected(t.RequestMethod) {
 			t.Body = eofReader
 		} else {
-			t.Body = &body{src: NewChunkedReader(r), hdr: msg, r: r, closing: t.Close}
+			t.Body = &body{src: NewChunkedReader(r), hdr: req, r: r, closing: t.Close}
 		}
 	case realLength == 0:
 		t.Body = eofReader
@@ -220,15 +196,11 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 		}
 	}
 
-	// Unify output
-	switch rr := msg.(type) {
-	case *Request:
-		rr.Body = t.Body
-		rr.ContentLength = t.ContentLength
-		rr.TransferEncoding = t.TransferEncoding
-		rr.Close = t.Close
-		rr.Trailer = t.Trailer
-	}
+	req.Body = t.Body
+	req.ContentLength = t.ContentLength
+	req.TransferEncoding = t.TransferEncoding
+	req.Close = t.Close
+	req.Trailer = t.Trailer
 
 	return nil
 }
@@ -355,6 +327,16 @@ func (b *body) Close() error {
 	return err
 }
 
+// unreadDataSizeLocked returns the number of bytes of unread input.
+// It returns -1 if unknown.
+// b.mu must be held.
+func (b *body) unreadDataSizeLocked() int64 {
+	if lr, ok := b.src.(*io.LimitedReader); ok {
+		return lr.N
+	}
+	return -1
+}
+
 // bodyLocked is a io.Reader reading from a *body when its mutex is
 // already held.
 type bodyLocked struct {
@@ -397,16 +379,15 @@ func chunked(te []string) bool { return len(te) > 0 && te[0] == "chunked" }
 // Determine the expected body length, using RFC 2616 Section 4.4. This
 // function is not a method, because ultimately it should be shared by
 // ReadResponse and ReadRequest.
-func fixLength(isResponse bool, status int, requestMethod string, header Header, te []string) (int64, error) {
+func fixLength(status int, requestMethod string, header Header, te []string) (int64, error) {
 	contentLens := header["Content-Length"]
-	isRequest := !isResponse
 	// Logic based on response type or status
 	if noBodyExpected(requestMethod) {
 		// For HTTP requests, as part of hardening against request
 		// smuggling (RFC 7230), don't allow a Content-Length header for
 		// methods which don't permit bodies. As an exception, allow
 		// exactly one Content-Length header if its value is "0".
-		if isRequest && len(contentLens) > 0 && !(len(contentLens) == 1 && contentLens[0] == "0") {
+		if len(contentLens) > 0 && !(len(contentLens) == 1 && contentLens[0] == "0") {
 			return 0, fmt.Errorf("http: method cannot contain a Content-Length; got %q", contentLens)
 		}
 		return 0, nil
@@ -444,19 +425,14 @@ func fixLength(isResponse bool, status int, requestMethod string, header Header,
 		header.Del("Content-Length")
 	}
 
-	if !isResponse {
-		// RFC 2616 neither explicitly permits nor forbids an
-		// entity-body on a GET request so we permit one if
-		// declared, but we default to 0 here (not -1 below)
-		// if there's no mention of a body.
-		// Likewise, all other request methods are assumed to have
-		// no body if neither Transfer-Encoding chunked nor a
-		// Content-Length are set.
-		return 0, nil
-	}
-
-	// Body-EOF logic based on other methods (like closing, or chunked coding)
-	return -1, nil
+	// RFC 2616 neither explicitly permits nor forbids an
+	// entity-body on a GET request so we permit one if
+	// declared, but we default to 0 here (not -1 below)
+	// if there's no mention of a body.
+	// Likewise, all other request methods are assumed to have
+	// no body if neither Transfer-Encoding chunked nor a
+	// Content-Length are set.
+	return 0, nil
 }
 
 // parseContentLength trims whitespace from s and returns -1 if no value
@@ -575,4 +551,24 @@ func mergeSetHeader(dst *Header, src Header) {
 	for k, vv := range src {
 		(*dst)[k] = vv
 	}
+}
+// Determine whether to hang up after sending a request and body, or
+// receiving a response and body
+// 'header' is the request headers
+func shouldClose(major, minor int, header Header, removeCloseHeader bool) bool {
+	if major < 1 {
+		return true
+	}
+
+	conv := header["Connection"]
+	hasClose := HeaderValuesContainsToken(conv, "close")
+	if major == 1 && minor == 0 {
+		return hasClose || !HeaderValuesContainsToken(conv, "keep-alive")
+	}
+
+	if hasClose && removeCloseHeader {
+		header.Del("Connection")
+	}
+
+	return hasClose
 }

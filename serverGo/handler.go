@@ -10,9 +10,58 @@ import (
 	"sync"
 )
 
+// A ResponseWriter interface is used by an HTTP handler to
+// construct an HTTP response.
+//
+// A ResponseWriter may not be used after the Handler.ServeHTTP method
+// has returned.
+type ResponseWriter interface {
+	// Header returns the header map that will be sent by
+	// WriteHeader. Changing the header after a call to
+	// WriteHeader (or Write) has no effect unless the modified
+	// headers were declared as trailers by setting the
+	// "Trailer" header before the call to WriteHeader (see example).
+	// To suppress implicit response headers, set their value to nil.
+	Header() Header
+
+	// Write writes the data to the connection as part of an HTTP reply.
+	//
+	// If WriteHeader has not yet been called, Write calls
+	// WriteHeader(http.StatusOK) before writing the data. If the Header
+	// does not contain a Content-Type line, Write adds a Content-Type set
+	// to the result of passing the initial 512 bytes of written data to
+	// DetectContentType.
+	//
+	// Depending on the HTTP protocol version and the client, calling
+	// Write or WriteHeader may prevent future reads on the
+	// Request.Body. For HTTP/1.x requests, handlers should read any
+	// needed request body data before writing the response. Once the
+	// headers have been flushed (due to either an explicit Flusher.Flush
+	// call or writing enough data to trigger a flush), the request body
+	// may be unavailable. For HTTP/2 requests, the Go HTTP server permits
+	// handlers to continue to read the request body while concurrently
+	// writing the response. However, such behavior may not be supported
+	// by all HTTP/2 clients. Handlers should read before writing if
+	// possible to maximize compatibility.
+	Write([]byte) (int, error)
+
+	// WriteHeader sends an HTTP response header with status code.
+	// If WriteHeader is not called explicitly, the first call to Write
+	// will trigger an implicit WriteHeader(http.StatusOK).
+	// Thus explicit calls to WriteHeader are mainly used to
+	// send error codes.
+	WriteHeader(int)
+}
+
 // Handler ...
 type Handler interface {
 	ServeHTTP(ResponseWriter, *Request)
+}
+
+type muxEntry struct {
+	explicit bool
+	h        Handler
+	pattern  string
 }
 
 // ServeMux is an HTTP request multiplexer.
@@ -55,11 +104,6 @@ type ServeMux struct {
 	m     map[string]muxEntry
 	hosts bool // whether any patterns contain hostnames
 }
-type muxEntry struct {
-	explicit bool
-	h        Handler
-	pattern  string
-}
 
 // ServeHTTP dispatches the request to the handler whose
 // pattern most closely matches the request URL.
@@ -75,6 +119,55 @@ func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
 	h.ServeHTTP(w, r)
 }
 
+// HandleFunc registers the handler function for the given pattern.
+func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+	mux.Handle(pattern, HandlerFunc(handler))
+}
+
+// Handle registers the handler for the given pattern.
+// If a handler already exists for pattern, Handle panics.
+func (mux *ServeMux) Handle(pattern string, handler Handler) {
+	mux.mu.Lock()
+	defer mux.mu.Unlock()
+
+	if pattern == "" {
+		panic("http: invalid pattern " + pattern)
+	}
+	if handler == nil {
+		panic("http: nil handler")
+	}
+	// 重复
+	if mux.m[pattern].explicit {
+		panic("http: multiple registrations for " + pattern)
+	}
+
+	if mux.m == nil {
+		mux.m = make(map[string]muxEntry)
+	}
+	mux.m[pattern] = muxEntry{explicit: true, h: handler, pattern: pattern}
+
+	if pattern[0] != '/' {
+		mux.hosts = true
+	}
+
+	// Helpful behavior:
+	// If pattern is /tree/, insert an implicit permanent redirect for /tree.
+	// It can be overridden by an explicit registration.
+	n := len(pattern)
+	if n > 0 && pattern[n-1] == '/' && !mux.m[pattern[0:n-1]].explicit {
+		// If pattern contains a host name, strip it and use remaining
+		// path for redirect.
+		path := pattern
+		if pattern[0] != '/' {
+			// In pattern, at least the last character is a '/', so
+			// strings.Index can't be -1.
+			path = pattern[strings.Index(pattern, "/"):]
+		}
+		url := &url.URL{Path: path}
+		mux.m[pattern[0:n-1]] = muxEntry{h: RedirectHandler(url.String(), StatusMovedPermanently), pattern: pattern}
+	}
+}
+
 // Handler returns the handler to use for the given request,
 // consulting r.Method, r.Host, and r.URL.Path. It always returns
 // a non-nil handler. If the path is not in its canonical form, the
@@ -88,7 +181,6 @@ func (mux *ServeMux) ServeHTTP(w ResponseWriter, r *Request) {
 // If there is no registered handler that applies to the request,
 // Handler returns a ``page not found'' handler and an empty pattern.
 func (mux *ServeMux) Handler(r *Request) (h Handler, pattern string) {
-
 	return mux.handler(r.Host, r.URL.Path)
 }
 
@@ -144,68 +236,6 @@ func pathMatch(pattern, path string) bool {
 	return len(path) >= n && path[0:n] == pattern
 }
 
-// A ResponseWriter interface is used by an HTTP handler to
-// construct an HTTP response.
-//
-// A ResponseWriter may not be used after the Handler.ServeHTTP method
-// has returned.
-type ResponseWriter interface {
-	// Header returns the header map that will be sent by
-	// WriteHeader. Changing the header after a call to
-	// WriteHeader (or Write) has no effect unless the modified
-	// headers were declared as trailers by setting the
-	// "Trailer" header before the call to WriteHeader (see example).
-	// To suppress implicit response headers, set their value to nil.
-	Header() Header
-
-	// Write writes the data to the connection as part of an HTTP reply.
-	//
-	// If WriteHeader has not yet been called, Write calls
-	// WriteHeader(http.StatusOK) before writing the data. If the Header
-	// does not contain a Content-Type line, Write adds a Content-Type set
-	// to the result of passing the initial 512 bytes of written data to
-	// DetectContentType.
-	//
-	// Depending on the HTTP protocol version and the client, calling
-	// Write or WriteHeader may prevent future reads on the
-	// Request.Body. For HTTP/1.x requests, handlers should read any
-	// needed request body data before writing the response. Once the
-	// headers have been flushed (due to either an explicit Flusher.Flush
-	// call or writing enough data to trigger a flush), the request body
-	// may be unavailable. For HTTP/2 requests, the Go HTTP server permits
-	// handlers to continue to read the request body while concurrently
-	// writing the response. However, such behavior may not be supported
-	// by all HTTP/2 clients. Handlers should read before writing if
-	// possible to maximize compatibility.
-	Write([]byte) (int, error)
-
-	// WriteHeader sends an HTTP response header with status code.
-	// If WriteHeader is not called explicitly, the first call to Write
-	// will trigger an implicit WriteHeader(http.StatusOK).
-	// Thus explicit calls to WriteHeader are mainly used to
-	// send error codes.
-	WriteHeader(int)
-}
-
-// serverHandler 路由处理
-type serverHandler struct {
-	srv *Server
-}
-
-func htmlEscape(s string) string {
-	return htmlReplacer.Replace(s)
-}
-
-var htmlReplacer = strings.NewReplacer(
-	"&", "&amp;",
-	"<", "&lt;",
-	">", "&gt;",
-	// "&#34;" is shorter than "&quot;".
-	`"`, "&#34;",
-	// "&#39;" is shorter than "&apos;" and apos was not in HTML until HTML5.
-	"'", "&#39;",
-)
-
 // globalOptionsHandler responds to "OPTIONS *" requests.
 type globalOptionsHandler struct{}
 
@@ -222,6 +252,11 @@ func (globalOptionsHandler) ServeHTTP(w ResponseWriter, r *Request) {
 	}
 }
 
+// serverHandler 路由处理
+type serverHandler struct {
+	srv *Server
+}
+
 func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 	handler := sh.srv.Handler
 	if handler == nil {
@@ -233,10 +268,10 @@ func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 	handler.ServeHTTP(rw, req)
 }
 
+var defaultServeMux ServeMux
+
 // DefaultServeMux is the default ServeMux used by Serve.
 var DefaultServeMux = &defaultServeMux
-
-var defaultServeMux ServeMux
 
 // RedirectHandler returns a request handler that redirects
 // each request it receives to the given url using the given
@@ -339,6 +374,21 @@ func NotFound(w ResponseWriter, r *Request) { Error(w, "404 page not found", Sta
 // that replies to each request with a ``404 page not found'' reply.
 func NotFoundHandler() Handler { return HandlerFunc(NotFound) }
 
+//////////////////////////////
+// func
+
+var htmlReplacer = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+	`"`, "&#34;",
+	"'", "&#39;",
+)
+
+func htmlEscape(s string) string {
+	return htmlReplacer.Replace(s)
+}
+
 // The HandlerFunc type is an adapter to allow the use of
 // ordinary functions as HTTP handlers. If f is a function
 // with the appropriate signature, HandlerFunc(f) is a
@@ -357,51 +407,6 @@ func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
 	DefaultServeMux.HandleFunc(pattern, handler)
 }
 
-// HandleFunc registers the handler function for the given pattern.
-func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
-	mux.Handle(pattern, HandlerFunc(handler))
-}
-
-// Handle registers the handler for the given pattern.
-// If a handler already exists for pattern, Handle panics.
-func (mux *ServeMux) Handle(pattern string, handler Handler) {
-	mux.mu.Lock()
-	defer mux.mu.Unlock()
-
-	if pattern == "" {
-		panic("http: invalid pattern " + pattern)
-	}
-	if handler == nil {
-		panic("http: nil handler")
-	}
-	// 重复
-	if mux.m[pattern].explicit {
-		panic("http: multiple registrations for " + pattern)
-	}
-
-	if mux.m == nil {
-		mux.m = make(map[string]muxEntry)
-	}
-	mux.m[pattern] = muxEntry{explicit: true, h: handler, pattern: pattern}
-
-	if pattern[0] != '/' {
-		mux.hosts = true
-	}
-
-	// Helpful behavior:
-	// If pattern is /tree/, insert an implicit permanent redirect for /tree.
-	// It can be overridden by an explicit registration.
-	n := len(pattern)
-	if n > 0 && pattern[n-1] == '/' && !mux.m[pattern[0:n-1]].explicit {
-		// If pattern contains a host name, strip it and use remaining
-		// path for redirect.
-		path := pattern
-		if pattern[0] != '/' {
-			// In pattern, at least the last character is a '/', so
-			// strings.Index can't be -1.
-			path = pattern[strings.Index(pattern, "/"):]
-		}
-		url := &url.URL{Path: path}
-		mux.m[pattern[0:n-1]] = muxEntry{h: RedirectHandler(url.String(), StatusMovedPermanently), pattern: pattern}
-	}
+func MaxBytesReader(w ResponseWriter, r io.ReadCloser, n int64) io.ReadCloser {
+	return &maxBytesReader{w: w, r: r, n: n}
 }
