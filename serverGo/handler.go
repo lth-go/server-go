@@ -2,6 +2,8 @@ package serverGo
 
 import (
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/url"
 	"path"
 	"strings"
@@ -190,6 +192,36 @@ type serverHandler struct {
 	srv *Server
 }
 
+func htmlEscape(s string) string {
+	return htmlReplacer.Replace(s)
+}
+
+var htmlReplacer = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+	// "&#34;" is shorter than "&quot;".
+	`"`, "&#34;",
+	// "&#39;" is shorter than "&apos;" and apos was not in HTML until HTML5.
+	"'", "&#39;",
+)
+
+// globalOptionsHandler responds to "OPTIONS *" requests.
+type globalOptionsHandler struct{}
+
+func (globalOptionsHandler) ServeHTTP(w ResponseWriter, r *Request) {
+	w.Header().Set("Content-Length", "0")
+	if r.ContentLength != 0 {
+		// Read up to 4KB of OPTIONS body (as mentioned in the
+		// spec as being reserved for future use), but anything
+		// over that is considered a waste of server resources
+		// (or an attack) and we abort and close the connection,
+		// courtesy of MaxBytesReader's EOF behavior.
+		mb := MaxBytesReader(w, r.Body, 4<<10)
+		io.Copy(ioutil.Discard, mb)
+	}
+}
+
 func (sh serverHandler) ServeHTTP(rw ResponseWriter, req *Request) {
 	handler := sh.srv.Handler
 	if handler == nil {
@@ -287,6 +319,17 @@ func Redirect(w ResponseWriter, r *Request, urlStr string, code int) {
 		note := "<a href=\"" + htmlEscape(urlStr) + "\">" + statusText[code] + "</a>.\n"
 		fmt.Fprintln(w, note)
 	}
+}
+
+// Error replies to the request with the specified error message and HTTP code.
+// It does not otherwise end the request; the caller should ensure no further
+// writes are done to w.
+// The error message should be plain text.
+func Error(w ResponseWriter, error string, code int) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(code)
+	fmt.Fprintln(w, error)
 }
 
 // NotFound replies to the request with an HTTP 404 not found error.

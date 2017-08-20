@@ -3,6 +3,7 @@ package serverGo
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -11,6 +12,23 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+)
+
+// HTTP request parsing errors.
+type ProtocolError struct {
+	ErrorString string
+}
+
+func (err *ProtocolError) Error() string { return err.ErrorString }
+
+var (
+	ErrHeaderTooLong        = &ProtocolError{"header too long"}
+	ErrShortBody            = &ProtocolError{"entity body too short"}
+	ErrNotSupported         = &ProtocolError{"feature not supported"}
+	ErrUnexpectedTrailer    = &ProtocolError{"trailer header without chunked transfer encoding"}
+	ErrMissingContentLength = &ProtocolError{"missing ContentLength in HEAD response"}
+	ErrNotMultipart         = &ProtocolError{"request Content-Type isn't multipart/form-data"}
+	ErrMissingBoundary      = &ProtocolError{"no multipart boundary param in Content-Type"}
 )
 
 type badStringError struct {
@@ -199,11 +217,6 @@ type Request struct {
 	// set, it is undefined whether Cancel is respected.
 	Cancel <-chan struct{}
 
-	// Response is the redirect response which caused this request
-	// to be created. This field is only populated during client
-	// redirects.
-	Response *Response
-
 	// ctx is either the client or server context. It should only
 	// be modified via copying the whole Request using WithContext.
 	// It is unexported to prevent people from using Context wrong
@@ -349,4 +362,64 @@ func http1ServerSupportsRequest(req *Request) bool {
 	// Reject HTTP/0.x, and all other HTTP/2+ requests (which
 	// aren't encoded in ASCII anyway).
 	return false
+}
+
+type maxBytesReader struct {
+	w   ResponseWriter
+	r   io.ReadCloser // underlying reader
+	n   int64         // max bytes remaining
+	err error         // sticky error
+}
+
+func (l *maxBytesReader) tooLarge() (n int, err error) {
+	l.err = errors.New("http: request body too large")
+	return 0, l.err
+}
+
+func (l *maxBytesReader) Read(p []byte) (n int, err error) {
+	if l.err != nil {
+		return 0, l.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	// If they asked for a 32KB byte read but only 5 bytes are
+	// remaining, no need to read 32KB. 6 bytes will answer the
+	// question of the whether we hit the limit or go past it.
+	if int64(len(p)) > l.n+1 {
+		p = p[:l.n+1]
+	}
+	n, err = l.r.Read(p)
+
+	if int64(n) <= l.n {
+		l.n -= int64(n)
+		l.err = err
+		return n, err
+	}
+
+	n = int(l.n)
+	l.n = 0
+
+	// The server code and client code both use
+	// maxBytesReader. This "requestTooLarge" check is
+	// only used by the server code. To prevent binaries
+	// which only using the HTTP Client code (such as
+	// cmd/go) from also linking in the HTTP server, don't
+	// use a static type assertion to the server
+	// "*response" type. Check this interface instead:
+	type requestTooLarger interface {
+		requestTooLarge()
+	}
+	if res, ok := l.w.(requestTooLarger); ok {
+		res.requestTooLarge()
+	}
+	l.err = errors.New("http: request body too large")
+	return n, l.err
+}
+
+func (l *maxBytesReader) Close() error {
+	return l.r.Close()
+}
+func MaxBytesReader(w ResponseWriter, r io.ReadCloser, n int64) io.ReadCloser {
+	return &maxBytesReader{w: w, r: r, n: n}
 }

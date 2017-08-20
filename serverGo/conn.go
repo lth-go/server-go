@@ -5,13 +5,16 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"runtime"
 	"sync"
 	"time"
-
-	"golang.org/x/net/lex/httplex"
 )
+
+type closeWriter interface {
+	CloseWrite() error
+}
 
 // http请求
 type conn struct {
@@ -60,6 +63,12 @@ var errTooLarge = errors.New("http: request too large")
 type badRequestError string
 
 func (e badRequestError) Error() string { return "Bad Request: " + string(e) }
+
+// Close the connection.
+func (c *conn) close() {
+	c.finalFlush()
+	c.rwc.Close()
+}
 
 // 开启一个新的连接
 func (c *conn) serve(ctx context.Context) {
@@ -114,9 +123,6 @@ func (c *conn) serve(ctx context.Context) {
 			io.WriteString(c.rwc, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n400 Bad Request"+publicErr)
 			return
 		}
-
-		// TODO
-		req := w.req
 
 		// 调用路由函数处理请求
 		serverHandler{c.server}.ServeHTTP(w, w.req)
@@ -173,16 +179,16 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	if len(hosts) > 1 {
 		return nil, badRequestError("too many Host headers")
 	}
-	if len(hosts) == 1 && !httplex.ValidHostHeader(hosts[0]) {
+	if len(hosts) == 1 && !ValidHostHeader(hosts[0]) {
 		return nil, badRequestError("malformed Host header")
 	}
 	// 检查请求头
 	for k, vv := range req.Header {
-		if !httplex.ValidHeaderFieldName(k) {
+		if !ValidHeaderFieldName(k) {
 			return nil, badRequestError("invalid header name")
 		}
 		for _, v := range vv {
-			if !httplex.ValidHeaderFieldValue(v) {
+			if !ValidHeaderFieldValue(v) {
 				return nil, badRequestError("invalid header value")
 			}
 		}
@@ -211,6 +217,10 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	return w, nil
 }
 
+// This should be >= 512 bytes for DetectContentType,
+// but otherwise it's somewhat arbitrary.
+const bufferBeforeChunkingSize = 2048
+
 // rstAvoidanceDelay is the amount of time we sleep after closing the
 // write side of a TCP connection before closing the entire socket.
 // By sleeping, we increase the chances that the client sees our FIN
@@ -233,6 +243,10 @@ func (c *conn) closeWriteAndWait() {
 	}
 	time.Sleep(rstAvoidanceDelay)
 }
+func putBufioReader(br *bufio.Reader) {
+	br.Reset(nil)
+	bufioReaderPool.Put(br)
+}
 
 func (c *conn) finalFlush() {
 	if c.bufr != nil {
@@ -249,6 +263,18 @@ func (c *conn) finalFlush() {
 		putBufioWriter(c.bufw)
 		c.bufw = nil
 	}
+}
+func (c *loggingConn) Close() (err error) {
+	log.Printf("%s.Close() = ...", c.name)
+	err = c.Conn.Close()
+	log.Printf("%s.Close() = %v", c.name, err)
+	return
+}
+
+type readResult struct {
+	n   int
+	err error
+	b   byte // byte read, if n == 1
 }
 
 // connReader is the io.Reader wrapper used by *conn. It combines a
@@ -267,9 +293,40 @@ type connReader struct {
 
 func (cr *connReader) setReadLimit(remain int64) { cr.remain = remain }
 
+// maxInt64 is the effective "infinite" value for the Server and
+// Transport's byte-limiting readers.
+const maxInt64 = 1<<63 - 1
+
 // 设置成无穷
 func (cr *connReader) setInfiniteReadLimit() { cr.remain = maxInt64 }
 func (cr *connReader) hitReadLimit() bool    { return cr.remain <= 0 }
+func (cr *connReader) Read(p []byte) (n int, err error) {
+	if cr.hitReadLimit() {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return
+	}
+	if int64(len(p)) > cr.remain {
+		p = p[:cr.remain]
+	}
+
+	// Is a background read (started by CloseNotifier) already in
+	// flight? If so, wait for it and use its result.
+	ch := cr.ch
+	if ch != nil {
+		cr.ch = nil
+		res := <-ch
+		if res.n == 1 {
+			p[0] = res.b
+			cr.remain -= 1
+		}
+		return res.n, res.err
+	}
+	n, err = cr.r.Read(p)
+	cr.remain -= int64(n)
+	return
+}
 
 // checkConnErrorWriter writes to c.rwc and records any write errors to c.werr.
 // It only contains one field (and a pointer field at that), so it
@@ -344,4 +401,24 @@ func putBufioWriter(bw *bufio.Writer) {
 	if pool := bufioWriterPool(bw.Available()); pool != nil {
 		pool.Put(bw)
 	}
+}
+
+// loggingConn is used for debugging.
+type loggingConn struct {
+	name string
+	net.Conn
+}
+
+func (c *loggingConn) Write(p []byte) (n int, err error) {
+	log.Printf("%s.Write(%d) = ....", c.name, len(p))
+	n, err = c.Conn.Write(p)
+	log.Printf("%s.Write(%d) = %d, %v", c.name, len(p), n, err)
+	return
+}
+
+func (c *loggingConn) Read(p []byte) (n int, err error) {
+	log.Printf("%s.Read(%d) = ....", c.name, len(p))
+	n, err = c.Conn.Read(p)
+	log.Printf("%s.Read(%d) = %d, %v", c.name, len(p), n, err)
+	return
 }

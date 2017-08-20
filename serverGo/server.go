@@ -47,6 +47,14 @@ type Server struct {
 	disableKeepAlives int32 // accessed atomically.
 }
 
+func (s *Server) logf(format string, args ...interface{}) {
+	if s.ErrorLog != nil {
+		s.ErrorLog.Printf(format, args...)
+	} else {
+		log.Printf(format, args...)
+	}
+}
+
 // ListenAndServe 监听并运行服务
 func (srv *Server) ListenAndServe() error {
 	addr := srv.Addr
