@@ -6,12 +6,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"mime"
 	"mime/multipart"
 	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+)
+
+const (
+	defaultMaxMemory = 32 << 20 // 32 MB
+)
+
+// ErrMissingFile is returned by FormFile when the provided file field name
+// is either not present in the request or not a file field.
+var ErrMissingFile = errors.New("http: no such file")
+var (
+	ErrNotMultipart    = &ProtocolError{"request Content-Type isn't multipart/form-data"}
+	ErrMissingBoundary = &ProtocolError{"no multipart boundary param in Content-Type"}
 )
 
 type badStringError struct {
@@ -113,11 +127,6 @@ func (r *Request) ProtoAtLeast(major, minor int) bool {
 		r.ProtoMajor == major && r.ProtoMinor >= minor
 }
 
-// UserAgent returns the client's User-Agent, if sent in the request.
-func (r *Request) UserAgent() string {
-	return r.Header.Get("User-Agent")
-}
-
 // Cookies parses and returns the HTTP cookies sent with the request.
 func (r *Request) Cookies() []*Cookie {
 	return readCookies(r.Header, "")
@@ -135,8 +144,228 @@ func (r *Request) Cookie(name string) (*Cookie, error) {
 	return nil, ErrNoCookie
 }
 
+// AddCookie adds a cookie to the request. Per RFC 6265 section 5.4,
+// AddCookie does not attach more than one Cookie header field. That
+// means all cookies, if any, are written into the same line,
+// separated by semicolon.
+func (r *Request) AddCookie(c *Cookie) {
+	s := fmt.Sprintf("%s=%s", sanitizeCookieName(c.Name), sanitizeCookieValue(c.Value))
+	if c := r.Header.Get("Cookie"); c != "" {
+		r.Header.Set("Cookie", c+"; "+s)
+	} else {
+		r.Header.Set("Cookie", s)
+	}
+}
+
 func (r *Request) wantsClose() bool {
 	return hasToken(r.Header.get("Connection"), "close")
+}
+
+// FormFile returns the first file for the provided form key.
+// FormFile calls ParseMultipartForm and ParseForm if necessary.
+func (r *Request) FormFile(key string) (multipart.File, *multipart.FileHeader, error) {
+	if r.MultipartForm == nil {
+		err := r.ParseMultipartForm(defaultMaxMemory)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if r.MultipartForm != nil && r.MultipartForm.File != nil {
+		if fhs := r.MultipartForm.File[key]; len(fhs) > 0 {
+			f, err := fhs[0].Open()
+			return f, fhs[0], err
+		}
+	}
+	return nil, nil, ErrMissingFile
+}
+
+// FormValue returns the first value for the named component of the query.
+// POST and PUT body parameters take precedence over URL query string values.
+// FormValue calls ParseMultipartForm and ParseForm if necessary and ignores
+// any errors returned by these functions.
+// If key is not present, FormValue returns the empty string.
+// To access multiple values of the same key, call ParseForm and
+// then inspect Request.Form directly.
+func (r *Request) FormValue(key string) string {
+	if r.Form == nil {
+		r.ParseMultipartForm(defaultMaxMemory)
+	}
+	if vs := r.Form[key]; len(vs) > 0 {
+		return vs[0]
+	}
+	return ""
+}
+
+// PostFormValue returns the first value for the named component of the POST
+// or PUT request body. URL query parameters are ignored.
+// PostFormValue calls ParseMultipartForm and ParseForm if necessary and ignores
+// any errors returned by these functions.
+// If key is not present, PostFormValue returns the empty string.
+func (r *Request) PostFormValue(key string) string {
+	if r.PostForm == nil {
+		r.ParseMultipartForm(defaultMaxMemory)
+	}
+	if vs := r.PostForm[key]; len(vs) > 0 {
+		return vs[0]
+	}
+	return ""
+}
+
+func copyValues(dst, src url.Values) {
+	for k, vs := range src {
+		for _, value := range vs {
+			dst.Add(k, value)
+		}
+	}
+}
+
+func parsePostForm(r *Request) (vs url.Values, err error) {
+	if r.Body == nil {
+		err = errors.New("missing form body")
+		return
+	}
+	ct := r.Header.Get("Content-Type")
+	// RFC 2616, section 7.2.1 - empty type
+	//   SHOULD be treated as application/octet-stream
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	ct, _, err = mime.ParseMediaType(ct)
+	switch {
+	case ct == "application/x-www-form-urlencoded":
+		var reader io.Reader = r.Body
+		maxFormSize := int64(1<<63 - 1)
+		if _, ok := r.Body.(*maxBytesReader); !ok {
+			maxFormSize = int64(10 << 20) // 10 MB is a lot of text.
+			reader = io.LimitReader(r.Body, maxFormSize+1)
+		}
+		b, e := ioutil.ReadAll(reader)
+		if e != nil {
+			if err == nil {
+				err = e
+			}
+			break
+		}
+		if int64(len(b)) > maxFormSize {
+			err = errors.New("http: POST too large")
+			return
+		}
+		vs, e = url.ParseQuery(string(b))
+		if err == nil {
+			err = e
+		}
+	case ct == "multipart/form-data":
+		// handled by ParseMultipartForm (which is calling us, or should be)
+		// TODO(bradfitz): there are too many possible
+		// orders to call too many functions here.
+		// Clean this up and write more tests.
+		// request_test.go contains the start of this,
+		// in TestParseMultipartFormOrder and others.
+	}
+	return
+}
+
+// ParseForm parses the raw query from the URL and updates r.Form.
+//
+// For POST or PUT requests, it also parses the request body as a form and
+// put the results into both r.PostForm and r.Form.
+// POST and PUT body parameters take precedence over URL query string values
+// in r.Form.
+//
+// If the request Body's size has not already been limited by MaxBytesReader,
+// the size is capped at 10MB.
+//
+// ParseMultipartForm calls ParseForm automatically.
+// It is idempotent.
+func (r *Request) ParseForm() error {
+	var err error
+	if r.PostForm == nil {
+		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
+			r.PostForm, err = parsePostForm(r)
+		}
+		if r.PostForm == nil {
+			r.PostForm = make(url.Values)
+		}
+	}
+	if r.Form == nil {
+		if len(r.PostForm) > 0 {
+			r.Form = make(url.Values)
+			copyValues(r.Form, r.PostForm)
+		}
+		var newValues url.Values
+		if r.URL != nil {
+			var e error
+			newValues, e = url.ParseQuery(r.URL.RawQuery)
+			if err == nil {
+				err = e
+			}
+		}
+		if newValues == nil {
+			newValues = make(url.Values)
+		}
+		if r.Form == nil {
+			r.Form = newValues
+		} else {
+			copyValues(r.Form, newValues)
+		}
+	}
+	return err
+}
+
+// ParseMultipartForm parses a request body as multipart/form-data.
+// The whole request body is parsed and up to a total of maxMemory bytes of
+// its file parts are stored in memory, with the remainder stored on
+// disk in temporary files.
+// ParseMultipartForm calls ParseForm if necessary.
+// After one call to ParseMultipartForm, subsequent calls have no effect.
+func (r *Request) ParseMultipartForm(maxMemory int64) error {
+	if r.Form == nil {
+		err := r.ParseForm()
+		if err != nil {
+			return err
+		}
+	}
+	if r.MultipartForm != nil {
+		return nil
+	}
+
+	mr, err := r.multipartReader()
+	if err != nil {
+		return err
+	}
+
+	f, err := mr.ReadForm(maxMemory)
+	if err != nil {
+		return err
+	}
+
+	if r.PostForm == nil {
+		r.PostForm = make(url.Values)
+	}
+	for k, v := range f.Value {
+		r.Form[k] = append(r.Form[k], v...)
+		// r.PostForm should also be populated. See Issue 9305.
+		r.PostForm[k] = append(r.PostForm[k], v...)
+	}
+
+	r.MultipartForm = f
+
+	return nil
+}
+func (r *Request) multipartReader() (*multipart.Reader, error) {
+	v := r.Header.Get("Content-Type")
+	if v == "" {
+		return nil, ErrNotMultipart
+	}
+	d, params, err := mime.ParseMediaType(v)
+	if err != nil || d != "multipart/form-data" {
+		return nil, ErrNotMultipart
+	}
+	boundary, ok := params["boundary"]
+	if !ok {
+		return nil, ErrMissingBoundary
+	}
+	return multipart.NewReader(r.Body, boundary), nil
 }
 
 type maxBytesReader struct {
