@@ -152,7 +152,7 @@ func readTransfer(req *Request, r *bufio.Reader) (err error) {
 	}
 
 	// Transfer encoding, content length
-	// 修正Transfer-Encoding编码
+	// TODO 修正Transfer-Encoding编码
 	err = t.fixTransferEncoding()
 	if err != nil {
 		return err

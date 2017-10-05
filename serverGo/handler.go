@@ -400,9 +400,8 @@ func (f HandlerFunc) ServeHTTP(w ResponseWriter, r *Request) {
 	f(w, r)
 }
 
-// HandleFunc registers the handler function for the given pattern
-// in the DefaultServeMux.
-// The documentation for ServeMux explains how patterns are matched.
+// HandleFunc registers the handler function for the given pattern in the DefaultServeMux.
+// 添加路由到默认服务
 func HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
 	DefaultServeMux.HandleFunc(pattern, handler)
 }

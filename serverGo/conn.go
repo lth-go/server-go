@@ -35,10 +35,6 @@ type readResult struct {
 type connReader struct {
 	r      io.Reader
 	remain int64 // bytes remaining
-
-	// ch is non-nil if a background read is in progress.
-	// It is guarded by conn.mu.
-	ch chan readResult
 }
 
 func (cr *connReader) setReadLimit(remain int64) { cr.remain = remain }
@@ -61,18 +57,6 @@ func (cr *connReader) Read(p []byte) (n int, err error) {
 		p = p[:cr.remain]
 	}
 
-	// Is a background read (started by CloseNotifier) already in
-	// flight? If so, wait for it and use its result.
-	ch := cr.ch
-	if ch != nil {
-		cr.ch = nil
-		res := <-ch
-		if res.n == 1 {
-			p[0] = res.b
-			cr.remain -= 1
-		}
-		return res.n, res.err
-	}
 	n, err = cr.r.Read(p)
 	cr.remain -= int64(n)
 	return
@@ -165,7 +149,7 @@ func (c *conn) serve(ctx context.Context) {
 	ctx, cancelCtx := context.WithCancel(ctx)
 	defer cancelCtx()
 
-	// TODO 为什么是for
+	// 长连接, 所以是for循环
 	for {
 		// 解析请求, 返回response
 		w, err := c.readRequest(ctx)
@@ -194,7 +178,7 @@ func (c *conn) serve(ctx context.Context) {
 		serverHandler{c.server}.ServeHTTP(w, w.req)
 		w.cancelCtx()
 
-		// TODO 不了解
+		// 关闭连接,不再接收请求
 		w.finishRequest()
 		if !w.shouldReuseConnection() {
 			if w.requestBodyLimitHit || w.closedRequestBodyEarly() {
@@ -265,6 +249,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	ctx, cancelCtx := context.WithCancel(ctx)
 	req.ctx = ctx
 	req.RemoteAddr = c.remoteAddr
+
 	if body, ok := req.Body.(*body); ok {
 		body.doEarlyClose = true
 	}

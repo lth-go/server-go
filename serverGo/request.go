@@ -360,6 +360,7 @@ func readRequest(b *bufio.Reader) (req *Request, err error) {
 	// 在transfer中用到
 	req.Close = shouldClose(req.ProtoMajor, req.ProtoMinor, req.Header, false)
 
+	// 解析body
 	err = readTransfer(req, b)
 	if err != nil {
 		return nil, err

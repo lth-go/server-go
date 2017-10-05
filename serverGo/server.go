@@ -12,7 +12,6 @@ import (
 // connections. It's used by ListenAndServe and ListenAndServeTLS so
 // dead TCP connections (e.g. closing laptop mid-download) eventually
 // go away.
-// TODO
 type tcpKeepAliveListener struct {
 	*net.TCPListener
 }
@@ -90,6 +89,7 @@ func (srv *Server) ListenAndServe() error {
 		addr = ":http"
 	}
 	// 监听端口
+	// ln 接口,包含accept(), Close() Addr()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -110,6 +110,7 @@ func (srv *Server) Serve(l net.Listener) error {
 		if e != nil {
 			return e
 		}
+		// 创建连接
 		c := srv.newConn(rw)
 		// 连接
 		go c.serve(ctx)
